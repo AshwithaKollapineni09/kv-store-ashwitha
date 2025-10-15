@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # Build Your Own Database - Project 1: Persistent Key-Value Store
-# Author: Ashwitha
+# Author: Ashwitha Kollapineni
 #
 # Implements a simple append-only key-value store.
-# - SET <key> <value>: stores a key/value pair
-# - GET <key>: retrieves the most recent value
-# - EXIT: closes the program
+# Commands supported:
+#   SET <key> <value> : stores a key/value pair
+#   GET <key>         : retrieves the most recent value
+#   EXIT              : closes the program
 #
 # Features:
 # * Append-only log (data.db) for durability
@@ -19,20 +20,24 @@ import sys
 
 DATA_FILE = "data.db"
 
+
 def valid_token(tok: str) -> bool:
     """Check if token has no spaces and is non-empty."""
     return bool(tok) and not any(c.isspace() for c in tok)
 
+
 class AppendOnlyKV:
+    """A simple append-only persistent key-value store."""
+
     def __init__(self, path: str):
+        """Initialize and load data from existing log."""
         self.path = path
         self.keys = []
         self.vals = []
-        # open file for append and replay existing data
         self._open_and_replay()
 
     def _open_and_replay(self):
-        # create file if not exists, then read all lines
+        """Rebuild in-memory data by replaying the append-only log."""
         self.fh = open(self.path, "a+", encoding="utf-8")
         self.fh.flush()
         os.fsync(self.fh.fileno())
@@ -44,7 +49,7 @@ class AppendOnlyKV:
                 if valid_token(key) and valid_token(val):
                     self.keys.append(key)
                     self.vals.append(val)
-        # move to end for new appends
+        # Move to end for appending
         self.fh.seek(0, os.SEEK_END)
 
     def set(self, key: str, val: str):
@@ -64,7 +69,7 @@ class AppendOnlyKV:
         return None
 
     def close(self):
-        """Close the log safely."""
+        """Safely close the log file."""
         try:
             self.fh.flush()
             os.fsync(self.fh.fileno())
@@ -74,6 +79,7 @@ class AppendOnlyKV:
 
 
 def main():
+    """Command-line interface for the key-value store."""
     db = AppendOnlyKV(DATA_FILE)
     try:
         for raw in sys.stdin:
@@ -92,20 +98,25 @@ def main():
                 else:
                     print("ERR")
                     sys.stdout.flush()
-            elif cmd == "GET":
-               if len(parts) == 2 and valid_token(parts[1]):
-                   val = db.get(parts[1])
-                if val is None:
-                      print("")       # print blank line if key not found
-           else:
-            print(val)
-        sys.stdout.flush()
-    else:
-        print("ERR")
-        sys.stdout.flush()
 
+            elif cmd == "GET":
+                if len(parts) == 2 and valid_token(parts[1]):
+                    val = db.get(parts[1])
+                    if val is None:
+                        print("")  # blank line if key not found
+                    else:
+                        print(val)
+                    sys.stdout.flush()
+                else:
+                    print("ERR")
+                    sys.stdout.flush()
+
+            else:
+                print("ERR")
+                sys.stdout.flush()
     finally:
         db.close()
+
 
 if __name__ == "__main__":
     main()
