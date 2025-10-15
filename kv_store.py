@@ -92,19 +92,18 @@ def main():
                 else:
                     print("ERR")
                     sys.stdout.flush()
-
             elif cmd == "GET":
-                if len(parts) == 2 and valid_token(parts[1]):
-                    val = db.get(parts[1])
-                    print(val if val is not None else "NULL")
-                    sys.stdout.flush()
-                else:
-                    print("ERR")
-                    sys.stdout.flush()
+               if len(parts) == 2 and valid_token(parts[1]):
+                   val = db.get(parts[1])
+                if val is None:
+                      print("")       # print blank line if key not found
+           else:
+            print(val)
+        sys.stdout.flush()
+    else:
+        print("ERR")
+        sys.stdout.flush()
 
-            else:
-                print("ERR")
-                sys.stdout.flush()
     finally:
         db.close()
 
