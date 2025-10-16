@@ -40,7 +40,7 @@ class SimpleHashMap:
         """
         cap = 1
         while cap < initial_capacity:
-            cap <<= 1  # ensure capacity is power of 2 for fast modulo
+            cap <<= 1
         self._buckets: List[List[Tuple[str, str]]] = [[] for _ in range(cap)]
         self._size = 0
 
@@ -49,15 +49,7 @@ class SimpleHashMap:
         return hash(key) & (len(self._buckets) - 1)
 
     def get(self, key: str) -> Optional[str]:
-        """
-        Retrieve the value for a key.
-
-        Args:
-            key (str): The key to look up.
-
-        Returns:
-            Optional[str]: The corresponding value or None if not found.
-        """
+        """Retrieve the value for a key or None if not found."""
         bucket = self._buckets[self._index(key)]
         for k, v in bucket:
             if k == key:
@@ -65,13 +57,7 @@ class SimpleHashMap:
         return None
 
     def set(self, key: str, value: str) -> None:
-        """
-        Insert or update a key-value pair.
-
-        Args:
-            key (str): The key to insert or update.
-            value (str): The value to store.
-        """
+        """Insert or update a key-value pair."""
         idx = self._index(key)
         bucket = self._buckets[idx]
         for i, (k, _) in enumerate(bucket):
@@ -89,34 +75,33 @@ class AppendOnlyKV:
     """Persistent key-value store using append-only file."""
 
     def __init__(self, path: str) -> None:
-        """
-        Initialize store and rebuild in-memory index.
-
-        Args:
-            path (str): Path to the data file.
-        """
+        """Initialize store and rebuild index from log."""
         self.path = path
         self._fh = None
         self._index = SimpleHashMap()
         self._open_and_replay()
 
     def __enter__(self) -> "AppendOnlyKV":
-        """Enable use as a context manager."""
+        """Enable use as context manager."""
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        """Ensure file is closed on exit."""
+        """Ensure file closes properly."""
         self.close()
 
     def _open_and_replay(self) -> None:
-        """Open file and rebuild index by replaying existing data."""
+        """Open file and rebuild index by replaying all previous SETs."""
         try:
             fh = open(self.path, "a+", encoding="utf-8")
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Cannot create or open {self.path}: {e}")
+        except PermissionError as e:
+            raise PermissionError(f"Permission denied for {self.path}: {e}")
         except OSError as e:
-            raise OSError(f"Failed to open {self.path}: {e}")
+            raise IOError(f"File operation failed: {e}")
+
         fh.seek(0)
         for line in fh:
-            # Reapply every SET from the log in order to restore latest values
             parts = line.strip().split()
             if len(parts) == 3 and parts[0] == "SET":
                 key, val = parts[1], parts[2]
@@ -126,49 +111,33 @@ class AppendOnlyKV:
         self._fh = fh
 
     def set(self, key: str, val: str) -> None:
-        """
-        Write SET record to file and update index.
-
-        Args:
-            key (str): Key to store.
-            val (str): Value to store.
-
-        Raises:
-            OSError: If writing to the file fails.
-        """
+        """Append a new SET operation to the file."""
         if not self._fh:
-            raise RuntimeError("File not open")
+            raise RuntimeError("File handle is not open.")
         try:
             self._fh.write(f"SET {key} {val}\n")
             self._fh.flush()
             os.fsync(self._fh.fileno())
             self._index.set(key, val)
-        except (OSError, ValueError) as e:
-            raise OSError(f"Failed to write record: {e}")
+        except ValueError as e:
+            raise ValueError(f"Invalid write value: {e}")
+        except OSError as e:
+            raise IOError(f"File write failed: {e}")
 
     def get(self, key: str) -> Optional[str]:
-        """
-        Retrieve value for a key.
-
-        Args:
-            key (str): The key to retrieve.
-
-        Returns:
-            Optional[str]: Value if found, None otherwise.
-        """
+        """Return value for a key or None if not found."""
         return self._index.get(key)
 
     def close(self) -> None:
-        """Flush and close file safely."""
+        """Flush and close the file safely."""
         if not self._fh:
             return
         try:
             self._fh.flush()
             os.fsync(self._fh.fileno())
             self._fh.close()
-        except (OSError, ValueError) as e:
-            # Raise explicit error to allow CLI to handle gracefully
-            raise OSError(f"Failed to close file: {e}")
+        except OSError as e:
+            raise IOError(f"Failed to close file: {e}")
         finally:
             self._fh = None
 
@@ -177,7 +146,7 @@ class AppendOnlyKV:
 # CLI interface
 # ---------------------------------------------------------------------------
 def _print_err() -> None:
-    """Standardized error message for invalid or failed operations."""
+    """Prints a standard ERR message to stdout."""
     print("ERR")
     sys.stdout.flush()
 
@@ -196,32 +165,30 @@ def main() -> None:
                 if cmd == "EXIT":
                     break
 
-                # Handle SET command
+                # Handle SET <key> <value>
                 if cmd == "SET":
                     if len(parts) == 3 and valid_token(parts[1]) and valid_token(parts[2]):
                         try:
                             db.set(parts[1], parts[2])
-                        except OSError:
+                        except (IOError, ValueError):
                             _print_err()
                     else:
                         _print_err()
                     continue
 
-                # Handle GET command
+                # Handle GET <key>
                 if cmd == "GET":
                     if len(parts) == 2 and valid_token(parts[1]):
                         val = db.get(parts[1])
                         print("" if val is None else val)
-                        sys.stdout.flush()  # ensure output appears immediately
+                        sys.stdout.flush()
                     else:
                         _print_err()
                     continue
 
-                # Invalid command
                 _print_err()
 
-    except (OSError, ValueError, RuntimeError):
-        # Catch specific known errors, no bare except anymore
+    except (FileNotFoundError, PermissionError, IOError, RuntimeError):
         _print_err()
 
 
