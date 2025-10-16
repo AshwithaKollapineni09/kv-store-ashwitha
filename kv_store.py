@@ -40,12 +40,12 @@ class SimpleHashMap:
         """
         cap = 1
         while cap < initial_capacity:
-            cap <<= 1
+            cap <<= 1  # ensure capacity is power of 2 for fast modulo
         self._buckets: List[List[Tuple[str, str]]] = [[] for _ in range(cap)]
         self._size = 0
 
     def _index(self, key: str) -> int:
-        """Compute bucket index for key."""
+        """Compute bucket index for key using bitmask (faster than modulo)."""
         return hash(key) & (len(self._buckets) - 1)
 
     def get(self, key: str) -> Optional[str]:
@@ -116,6 +116,7 @@ class AppendOnlyKV:
             raise OSError(f"Failed to open {self.path}: {e}")
         fh.seek(0)
         for line in fh:
+            # Reapply every SET from the log in order to restore latest values
             parts = line.strip().split()
             if len(parts) == 3 and parts[0] == "SET":
                 key, val = parts[1], parts[2]
@@ -166,6 +167,7 @@ class AppendOnlyKV:
             os.fsync(self._fh.fileno())
             self._fh.close()
         except (OSError, ValueError) as e:
+            # Raise explicit error to allow CLI to handle gracefully
             raise OSError(f"Failed to close file: {e}")
         finally:
             self._fh = None
@@ -175,7 +177,7 @@ class AppendOnlyKV:
 # CLI interface
 # ---------------------------------------------------------------------------
 def _print_err() -> None:
-    """Standardized error message."""
+    """Standardized error message for invalid or failed operations."""
     print("ERR")
     sys.stdout.flush()
 
@@ -194,6 +196,7 @@ def main() -> None:
                 if cmd == "EXIT":
                     break
 
+                # Handle SET command
                 if cmd == "SET":
                     if len(parts) == 3 and valid_token(parts[1]) and valid_token(parts[2]):
                         try:
@@ -204,17 +207,21 @@ def main() -> None:
                         _print_err()
                     continue
 
+                # Handle GET command
                 if cmd == "GET":
                     if len(parts) == 2 and valid_token(parts[1]):
                         val = db.get(parts[1])
                         print("" if val is None else val)
-                        sys.stdout.flush()
+                        sys.stdout.flush()  # ensure output appears immediately
                     else:
                         _print_err()
                     continue
 
+                # Invalid command
                 _print_err()
-    except Exception:
+
+    except (OSError, ValueError, RuntimeError):
+        # Catch specific known errors, no bare except anymore
         _print_err()
 
 
