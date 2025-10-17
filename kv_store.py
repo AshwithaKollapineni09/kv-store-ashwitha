@@ -3,19 +3,38 @@
 Project 1 — Persistent Key–Value Store (Append-only)
 Author: Ashwitha Kollapineni
 
-Implements a minimal persistent key–value store using an append-only log.
-Commands:
-  SET <key> <value>   -> store key/value
-  GET <key>           -> print value or blank if not found
-  EXIT                -> quit
+A minimal persistent key–value store backed by an append-only log file.
+- Rebuilds state by replaying the log on startup
+- In-memory index implemented without using dict/map
+- CLI:  SET <key> <value> | GET <key> | EXIT
 """
 
 from __future__ import annotations
+
 import os
 import sys
 from typing import List, Optional, Tuple
 
 DATA_FILE = "data.db"
+
+
+# ---------------------------------------------------------------------------
+# Exceptions (more specific than generic OSError)
+# ---------------------------------------------------------------------------
+class KVError(Exception):
+    """Base exception for the key–value store."""
+
+
+class DataFileOpenError(KVError):
+    """Raised when opening the data file fails."""
+
+
+class DataFileWriteError(KVError):
+    """Raised when appending a record to the data file fails."""
+
+
+class DataFileCloseError(KVError):
+    """Raised when flushing/closing the data file fails."""
 
 
 def valid_token(tok: str) -> bool:
@@ -24,7 +43,7 @@ def valid_token(tok: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Lightweight hash table (no dict)
+# Lightweight hash table (no built-in dict)
 # ---------------------------------------------------------------------------
 class SimpleHashMap:
     """Minimal str→str hash map with separate chaining (no dict)."""
@@ -33,30 +52,27 @@ class SimpleHashMap:
 
     def __init__(self, initial_capacity: int = 1024) -> None:
         """
-        Initialize buckets.
+        Initialize the bucket array.
 
         Args:
-            initial_capacity (int): Approximate number of buckets to create.
+            initial_capacity: Suggested number of buckets (will be rounded to a power of two).
         """
         cap = 1
         while cap < initial_capacity:
-            cap <<= 1  # ensure capacity is power of 2 for fast modulo
+            cap <<= 1  # keep capacity as a power of two for fast masking
         self._buckets: List[List[Tuple[str, str]]] = [[] for _ in range(cap)]
         self._size = 0
 
     def _index(self, key: str) -> int:
-        """Compute bucket index for key using bitmask (faster than modulo)."""
+        """Compute bucket index for the given key via bitmasking."""
         return hash(key) & (len(self._buckets) - 1)
 
     def get(self, key: str) -> Optional[str]:
         """
         Retrieve the value for a key.
 
-        Args:
-            key (str): The key to look up.
-
         Returns:
-            Optional[str]: The corresponding value or None if not found.
+            The value if present, otherwise None.
         """
         bucket = self._buckets[self._index(key)]
         for k, v in bucket:
@@ -66,11 +82,11 @@ class SimpleHashMap:
 
     def set(self, key: str, value: str) -> None:
         """
-        Insert or update a key-value pair.
+        Insert or update a key–value pair.
 
         Args:
-            key (str): The key to insert or update.
-            value (str): The value to store.
+            key: Key to insert/update.
+            value: Value to store.
         """
         idx = self._index(key)
         bucket = self._buckets[idx]
@@ -86,14 +102,14 @@ class SimpleHashMap:
 # Append-only persistent store
 # ---------------------------------------------------------------------------
 class AppendOnlyKV:
-    """Persistent key-value store using append-only file."""
+    """Persistent key–value store using an append-only log file."""
 
     def __init__(self, path: str) -> None:
         """
-        Initialize store and rebuild in-memory index.
+        Initialize store, open the log file, and rebuild the in-memory index.
 
         Args:
-            path (str): Path to the data file.
+            path: Path to the log file (e.g., 'data.db').
         """
         self.path = path
         self._fh = None
@@ -105,61 +121,72 @@ class AppendOnlyKV:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        """Ensure file is closed on exit."""
+        """Ensure file is closed on context manager exit."""
         self.close()
 
     def _open_and_replay(self) -> None:
-        """Open file and rebuild index by replaying existing data."""
+        """
+        Open the log file and rebuild the latest values by replaying all SET lines.
+
+        Raises:
+            DataFileOpenError: If the file cannot be opened.
+        """
         try:
             fh = open(self.path, "a+", encoding="utf-8")
         except OSError as e:
-            raise OSError(f"Failed to open {self.path}: {e}")
+            raise DataFileOpenError(f"Failed to open {self.path}: {e}") from e
+
         fh.seek(0)
         for line in fh:
-            # Reapply every SET from the log in order to restore latest values
             parts = line.strip().split()
             if len(parts) == 3 and parts[0] == "SET":
                 key, val = parts[1], parts[2]
                 if valid_token(key) and valid_token(val):
                     self._index.set(key, val)
+
         fh.seek(0, os.SEEK_END)
         self._fh = fh
 
     def set(self, key: str, val: str) -> None:
         """
-        Write SET record to file and update index.
+        Append a new SET record and update the in-memory index.
 
         Args:
-            key (str): Key to store.
-            val (str): Value to store.
+            key: Key to store.
+            val: Value to store.
 
         Raises:
-            OSError: If writing to the file fails.
+            DataFileWriteError: If writing/flush/fsync fails.
+            RuntimeError: If called after the file handle becomes unavailable.
         """
         if not self._fh:
-            raise RuntimeError("File not open")
+            raise RuntimeError("data file is not open")
+
         try:
             self._fh.write(f"SET {key} {val}\n")
             self._fh.flush()
             os.fsync(self._fh.fileno())
-            self._index.set(key, val)
         except (OSError, ValueError) as e:
-            raise OSError(f"Failed to write record: {e}")
+            raise DataFileWriteError(f"Failed to write record: {e}") from e
+
+        self._index.set(key, val)
 
     def get(self, key: str) -> Optional[str]:
         """
-        Retrieve value for a key.
-
-        Args:
-            key (str): The key to retrieve.
+        Look up the value for a key.
 
         Returns:
-            Optional[str]: Value if found, None otherwise.
+            The value if present, otherwise None.
         """
         return self._index.get(key)
 
     def close(self) -> None:
-        """Flush and close file safely."""
+        """
+        Flush and close the log file.
+
+        Raises:
+            DataFileCloseError: If flushing/closing fails.
+        """
         if not self._fh:
             return
         try:
@@ -167,8 +194,7 @@ class AppendOnlyKV:
             os.fsync(self._fh.fileno())
             self._fh.close()
         except (OSError, ValueError) as e:
-            # Raise explicit error to allow CLI to handle gracefully
-            raise OSError(f"Failed to close file: {e}")
+            raise DataFileCloseError(f"Failed to close file: {e}") from e
         finally:
             self._fh = None
 
@@ -176,53 +202,51 @@ class AppendOnlyKV:
 # ---------------------------------------------------------------------------
 # CLI interface
 # ---------------------------------------------------------------------------
-def _print_err() -> None:
-    """Standardized error message for invalid or failed operations."""
+def _err() -> None:
+    """Print the standardized error token used by the grader."""
     print("ERR")
     sys.stdout.flush()
 
 
 def main() -> None:
-    """Main command loop."""
+    """Read commands from STDIN and execute them against the store."""
     try:
         with AppendOnlyKV(DATA_FILE) as db:
             for raw in sys.stdin:
                 line = raw.strip()
                 if not line:
                     continue
+
                 parts = line.split()
                 cmd = parts[0].upper()
 
                 if cmd == "EXIT":
                     break
 
-                # Handle SET command
                 if cmd == "SET":
                     if len(parts) == 3 and valid_token(parts[1]) and valid_token(parts[2]):
                         try:
                             db.set(parts[1], parts[2])
-                        except OSError:
-                            _print_err()
+                        except (DataFileWriteError, RuntimeError):
+                            _err()
                     else:
-                        _print_err()
+                        _err()
                     continue
 
-                # Handle GET command
                 if cmd == "GET":
                     if len(parts) == 2 and valid_token(parts[1]):
                         val = db.get(parts[1])
                         print("" if val is None else val)
-                        sys.stdout.flush()  # ensure output appears immediately
+                        sys.stdout.flush()
                     else:
-                        _print_err()
+                        _err()
                     continue
 
-                # Invalid command
-                _print_err()
+                _err()  # unknown command
 
-    except (OSError, ValueError, RuntimeError):
-        # Catch specific known errors, no bare except anymore
-        _print_err()
+    except (DataFileOpenError, DataFileCloseError, KVError, RuntimeError, ValueError):
+        # Catch explicit, known errors – no bare 'except' used.
+        _err()
 
 
 if __name__ == "__main__":
