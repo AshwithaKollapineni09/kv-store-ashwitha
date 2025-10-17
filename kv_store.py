@@ -4,16 +4,23 @@ Project 1 — Persistent Key–Value Store (Append-only)
 Author: Ashwitha Kollapineni
 
 A minimal persistent key–value store backed by an append-only log file.
-- Rebuilds state by replaying the log on startup
-- In-memory index implemented without using dict/map
-- CLI:  SET <key> <value> | GET <key> | EXIT
+
+Design highlights
+-----------------
+* **Durability:** Each `SET` is appended to `data.db`, flushed, and fsynced.
+* **Recovery:** On startup, the log is replayed to rebuild in-memory state.
+* **Index:** A tiny hash map is implemented *without* using Python dicts/maps.
+* **CLI:** Reads commands from STDIN: `SET <key> <value>`, `GET <key>`, `EXIT`.
+
+This module is intentionally small and self-contained to make the data-path and
+persistence story easy to follow for a first project.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Type, Optional as Opt
 
 DATA_FILE = "data.db"
 
@@ -38,7 +45,19 @@ class DataFileCloseError(KVError):
 
 
 def valid_token(tok: str) -> bool:
-    """Return True if token is non-empty and contains no whitespace."""
+    """
+    Check whether a token is acceptable for keys/values in this project.
+
+    Args:
+        tok: A string to validate.
+
+    Returns:
+        True if `tok` is non-empty and contains **no whitespace**; False otherwise.
+
+    Notes:
+        This project purposely keeps the grammar simple: keys and values are
+        single, space-free tokens. That matches the black-box tests’ expectations.
+    """
     return bool(tok) and not any(c.isspace() for c in tok)
 
 
@@ -46,16 +65,31 @@ def valid_token(tok: str) -> bool:
 # Lightweight hash table (no built-in dict)
 # ---------------------------------------------------------------------------
 class SimpleHashMap:
-    """Minimal str→str hash map with separate chaining (no dict)."""
+    """
+    Minimal `str -> str` hash map using separate chaining.
+
+    We avoid Python’s built-in `dict` on purpose to meet the “no dict/map” rule.
+    Buckets are lists of `(key, value)` pairs. The number of buckets is a power
+    of two so we can use a bit mask instead of modulo for fast indexing.
+
+    Invariants:
+        * Keys are unique; calling `set()` with the same key overwrites the value.
+        * All stored keys/values are strings.
+
+    Complexity:
+        * `get` — average O(1); worst-case O(n) in a single bucket
+        * `set` — average O(1); replaces value if key exists, otherwise appends
+    """
 
     __slots__ = ("_buckets", "_size")
 
     def __init__(self, initial_capacity: int = 1024) -> None:
         """
-        Initialize the bucket array.
+        Create an empty table with at least `initial_capacity` buckets.
 
         Args:
-            initial_capacity: Suggested number of buckets (will be rounded to a power of two).
+            initial_capacity: Suggested number of buckets. It will be rounded
+                up to the next power of two for efficient masking.
         """
         cap = 1
         while cap < initial_capacity:
@@ -64,15 +98,38 @@ class SimpleHashMap:
         self._size = 0
 
     def _index(self, key: str) -> int:
-        """Compute bucket index for the given key via bitmasking."""
+        """
+        Compute the bucket index for `key`.
+
+        Args:
+            key: Key to hash.
+
+        Returns:
+            An integer index in `[0, len(_buckets))`.
+
+        Notes:
+            Uses `hash(key) & (len(_buckets) - 1)` which is faster than modulo
+            when the bucket count is a power of two.
+        """
         return hash(key) & (len(self._buckets) - 1)
 
     def get(self, key: str) -> Optional[str]:
         """
-        Retrieve the value for a key.
+        Retrieve the value for `key`.
+
+        Args:
+            key: Key to look up.
 
         Returns:
-            The value if present, otherwise None.
+            The associated value if present; otherwise `None`.
+
+        Examples:
+            >>> m = SimpleHashMap(4)
+            >>> m.set("x", "1")
+            >>> m.get("x")
+            '1'
+            >>> m.get("y") is None
+            True
         """
         bucket = self._buckets[self._index(key)]
         for k, v in bucket:
@@ -82,11 +139,21 @@ class SimpleHashMap:
 
     def set(self, key: str, value: str) -> None:
         """
-        Insert or update a key–value pair.
+        Insert a new `(key, value)` or overwrite an existing key.
 
         Args:
             key: Key to insert/update.
             value: Value to store.
+
+        Returns:
+            None. The table is updated in place.
+
+        Examples:
+            >>> m = SimpleHashMap(4)
+            >>> m.set("a", "1")
+            >>> m.set("a", "2")
+            >>> m.get("a")
+            '2'
         """
         idx = self._index(key)
         bucket = self._buckets[idx]
@@ -102,7 +169,19 @@ class SimpleHashMap:
 # Append-only persistent store
 # ---------------------------------------------------------------------------
 class AppendOnlyKV:
-    """Persistent key–value store using an append-only log file."""
+    """
+    Persistent key–value store using an append-only log file.
+
+    Data path:
+        * `SET k v` is appended to the log, flushed, and fsynced, then the in-memory
+          index is updated.
+        * `GET k` returns the most recent value recorded for `k` or an empty line
+          if not present (per the project spec).
+
+    Error model:
+        * We use explicit exceptions (`DataFileOpenError`, `DataFileWriteError`,
+          `DataFileCloseError`) to avoid bare `OSError` in the public surface.
+    """
 
     def __init__(self, path: str) -> None:
         """
@@ -110,6 +189,9 @@ class AppendOnlyKV:
 
         Args:
             path: Path to the log file (e.g., 'data.db').
+
+        Raises:
+            DataFileOpenError: If the file cannot be created or opened.
         """
         self.path = path
         self._fh = None
@@ -117,19 +199,44 @@ class AppendOnlyKV:
         self._open_and_replay()
 
     def __enter__(self) -> "AppendOnlyKV":
-        """Enable use as a context manager."""
+        """
+        Enter the context manager.
+
+        Returns:
+            The store itself, so callers can write `with AppendOnlyKV(...) as db: ...`.
+
+        Notes:
+            Nothing special is required here besides returning `self`; file
+            ownership is handled in `_open_and_replay` and `close`.
+        """
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        """Ensure file is closed on context manager exit."""
+    def __exit__(
+        self,
+        exc_type: Opt[Type[BaseException]],
+        exc: Opt[BaseException],
+        tb: Opt[object],
+    ) -> None:
+        """
+        Exit the context manager, ensuring the file is safely closed.
+
+        Args:
+            exc_type: Exception type if one was raised inside the `with` block.
+            exc: The exception instance (or None).
+            tb: Traceback object (or None).
+
+        Notes:
+            We always attempt to close; any close failure is raised as
+            `DataFileCloseError` to be caught by the CLI.
+        """
         self.close()
 
     def _open_and_replay(self) -> None:
         """
-        Open the log file and rebuild the latest values by replaying all SET lines.
+        Open the log file and rebuild the latest values by replaying all `SET` lines.
 
         Raises:
-            DataFileOpenError: If the file cannot be opened.
+            DataFileOpenError: If the file cannot be opened for read/append.
         """
         try:
             fh = open(self.path, "a+", encoding="utf-8")
@@ -149,15 +256,18 @@ class AppendOnlyKV:
 
     def set(self, key: str, val: str) -> None:
         """
-        Append a new SET record and update the in-memory index.
+        Append a new `SET` record and update the in-memory index.
 
         Args:
             key: Key to store.
             val: Value to store.
 
         Raises:
+            RuntimeError: If the data file is not open.
             DataFileWriteError: If writing/flush/fsync fails.
-            RuntimeError: If called after the file handle becomes unavailable.
+
+        Postconditions:
+            On success, the record is durable on disk and visible via `get`.
         """
         if not self._fh:
             raise RuntimeError("data file is not open")
@@ -175,8 +285,14 @@ class AppendOnlyKV:
         """
         Look up the value for a key.
 
+        Args:
+            key: Key to retrieve.
+
         Returns:
-            The value if present, otherwise None.
+            The latest stored value for `key` if present; otherwise `None`.
+
+        Notes:
+            The CLI prints an **empty line** for `None` to match the black-box tests.
         """
         return self._index.get(key)
 
@@ -185,7 +301,7 @@ class AppendOnlyKV:
         Flush and close the log file.
 
         Raises:
-            DataFileCloseError: If flushing/closing fails.
+            DataFileCloseError: If flushing or closing the file handle fails.
         """
         if not self._fh:
             return
@@ -203,13 +319,30 @@ class AppendOnlyKV:
 # CLI interface
 # ---------------------------------------------------------------------------
 def _err() -> None:
-    """Print the standardized error token used by the grader."""
+    """
+    Print the standardized error token used by the grader.
+
+    Notes:
+        The grader expects the literal string `ERR` on invalid input or on
+        unexpected I/O failures. Keep this output stable.
+    """
     print("ERR")
     sys.stdout.flush()
 
 
 def main() -> None:
-    """Read commands from STDIN and execute them against the store."""
+    """
+    Read commands from STDIN and execute them against the store.
+
+    Commands:
+        SET <key> <value>  -> persist key/value (last write wins)
+        GET <key>          -> print value or **blank line** if not found
+        EXIT               -> terminate the process
+
+    Error handling:
+        * Invalid arity or invalid tokens -> print `ERR`
+        * I/O errors are converted to specific exceptions and handled centrally
+    """
     try:
         with AppendOnlyKV(DATA_FILE) as db:
             for raw in sys.stdin:
@@ -236,6 +369,7 @@ def main() -> None:
                 if cmd == "GET":
                     if len(parts) == 2 and valid_token(parts[1]):
                         val = db.get(parts[1])
+                        # Gradebot wants an empty line when not found
                         print("" if val is None else val)
                         sys.stdout.flush()
                     else:
@@ -245,7 +379,7 @@ def main() -> None:
                 _err()  # unknown command
 
     except (DataFileOpenError, DataFileCloseError, KVError, RuntimeError, ValueError):
-        # Catch explicit, known errors – no bare 'except' used.
+        # Catch explicit, known errors – no bare 'except'.
         _err()
 
 
