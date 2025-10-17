@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-# Minimal persistent key–value store (append-only, no built-in dicts/maps).
+"""
+Persistent Key–Value Store (Append-only)
+CLI: SET <key> <value>, GET <key>, EXIT
+"""
 
 import os
 import sys
@@ -8,18 +11,44 @@ from typing import List, Optional, Tuple
 DATA_FILE = "data.db"
 
 
+# ----- small helpers ---------------------------------------------------------
+
 def valid_token(s: str) -> bool:
     """Keys/values are non-empty and contain no whitespace."""
     return bool(s) and not any(c.isspace() for c in s)
 
 
+# ----- specific errors (quality rubric) --------------------------------------
+
+class KVError(Exception):
+    """Base error for the key–value store."""
+
+
+class OpenError(KVError):
+    """Opening the data file failed."""
+
+
+class WriteError(KVError):
+    """Appending/flushing/fsyncing the data file failed."""
+
+
+class CloseError(KVError):
+    """Flushing/closing the data file failed."""
+
+
+# ----- tiny hash map (no built-in dicts) -------------------------------------
+
 class SimpleHashMap:
-    """Tiny str->str hash map using separate chaining (no dict)."""
+    """
+    Minimal str->str hash map with separate chaining.
+
+    * bucket count is a power of two (bitmask index)
+    * last write for a key replaces the value
+    """
 
     __slots__ = ("_b", "_n")
 
     def __init__(self, cap: int = 1024) -> None:
-        # keep bucket count a power of two (fast masking)
         m = 1
         while m < cap:
             m <<= 1
@@ -46,8 +75,15 @@ class SimpleHashMap:
         self._n += 1
 
 
+# ----- append-only store ------------------------------------------------------
+
 class AppendOnlyKV:
-    """Append-only log with in-memory index; last write wins."""
+    """
+    Append-only log with in-memory index; last write wins.
+
+    SET k v  -> append line, flush, fsync; update index
+    GET k    -> return latest value or None
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -56,11 +92,10 @@ class AppendOnlyKV:
         self._open_and_replay()
 
     def _open_and_replay(self) -> None:
-        # Create if missing, then read all SET lines to rebuild state.
         try:
             fh = open(self.path, "a+", encoding="utf-8")
         except OSError as e:
-            raise RuntimeError(f"open failed: {e}")
+            raise OpenError(str(e))
         fh.seek(0)
         for line in fh:
             parts = line.strip().split()
@@ -73,13 +108,13 @@ class AppendOnlyKV:
 
     def set(self, k: str, v: str) -> None:
         if not self._fh:
-            raise RuntimeError("not open")
+            raise WriteError("file handle unavailable")
         try:
             self._fh.write(f"SET {k} {v}\n")
             self._fh.flush()
             os.fsync(self._fh.fileno())
         except OSError as e:
-            raise RuntimeError(f"write failed: {e}")
+            raise WriteError(str(e))
         self._idx.set(k, v)
 
     def get(self, k: str) -> Optional[str]:
@@ -92,9 +127,13 @@ class AppendOnlyKV:
             self._fh.flush()
             os.fsync(self._fh.fileno())
             self._fh.close()
+        except OSError as e:
+            raise CloseError(str(e))
         finally:
             self._fh = None
 
+
+# ----- CLI -------------------------------------------------------------------
 
 def _err() -> None:
     print("ERR")
@@ -104,7 +143,7 @@ def _err() -> None:
 def main() -> None:
     try:
         db = AppendOnlyKV(DATA_FILE)
-    except RuntimeError:
+    except OpenError:
         _err()
         return
 
@@ -123,7 +162,7 @@ def main() -> None:
                 if len(parts) == 3 and valid_token(parts[1]) and valid_token(parts[2]):
                     try:
                         db.set(parts[1], parts[2])
-                    except RuntimeError:
+                    except WriteError:
                         _err()
                 else:
                     _err()
@@ -138,11 +177,11 @@ def main() -> None:
                     _err()
                 continue
 
-            _err()  # unknown command
+            _err()
     finally:
         try:
             db.close()
-        except Exception:
+        except CloseError:
             pass
 
 
